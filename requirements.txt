@@ -2,7 +2,8 @@ streamlit
 pandas
 requests
 yfinance
-edgar
+edgartools
 langgraph
 langchain-google-genai
+
 langchain-core
