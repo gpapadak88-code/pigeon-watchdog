@@ -30,13 +30,13 @@ SEC_ITEM_MAP = {
     "Item 9.01": "Financial Exhibits (Check Attachments for Prices)"
 }
 
-# --- FULL AGENT CLASS (From your original script) ---
+# --- FULL AGENT CLASS ---
 google_search_tool = {"google_search": {}}
 
 class Agent:
     def __init__(self, model_name="gemini-2.5-flash-lite", system=""):
         self.system = system
-        # Use st.secrets instead of os.environ for Streamlit Cloud safety
+																		 
         self.llm = ChatGoogleGenerativeAI(
             model=model_name,
             api_key=st.secrets["GOOGLE_API_KEY"]
@@ -70,12 +70,12 @@ class Agent:
         tool_calls = state['messages'][-1].tool_calls
         results = []
         for t in tool_calls:
-            # Acknowledgement for the native Google tool
+														
             result = "Searching Google for latest stock news and filings..."
             results.append(ToolMessage(tool_call_id=t['id'], name=t['name'], content=str(result)))
         return {'messages': results}
 
-# Initialize the Agent in Session State so it persists
+													  
 if 'pigeon_bot' not in st.session_state:
     prompt = """You are an expert Equity Research Assistant. Investigate price drops for tickers.
     1. Identify Primary Cause (News/8-K). 2. Structural vs Transitory. 3. Recovery Catalysts. 4. Sentiment.
@@ -86,7 +86,7 @@ if 'pigeon_bot' not in st.session_state:
 # --- CORE FUNCTIONS ---
 
 def get_sec_insight(ticker):
-    """Refactored from edgar-latest8k.txt"""
+											
     try:
         company = Company(ticker)
         filings = company.get_filings(form="8-K")
@@ -100,28 +100,34 @@ def get_sec_insight(ticker):
     return "N/A"
 
 def get_ai_recovery_score(ticker):
-    """UPDATED: Now uses the Full LangGraph Agent"""
+													
     inputs = {
         "messages": [
             HumanMessage(content=f"Perform a deep dive analysis on {ticker}. Why did it drop and what is the recovery score?")
         ]
     }
     try:
-        # Run the graph and get the final message from the result
+																 
         result = st.session_state.pigeon_bot.graph.invoke(inputs)
         return result['messages'][-1].content
     except Exception as e:
         return f"Agent Error: {str(e)}"
 
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=5400) # Updated to 90 minutes (5400 seconds)
 def run_pigeon_bite_logic():
-    """The master engine from alpha_losers.txt"""
+												 
     api_key = st.secrets["ALPHA_VANTAGE_KEY"]
     url = f'https://www.alphavantage.co/query?function=TOP_GAINERS_LOSERS&apikey={api_key}'
     
     try:
         data = requests.get(url).json()
+        if "Note" in data:
+            st.warning("Alpha Vantage Limit Reached. Showing cached or empty data.")
+            return pd.DataFrame()
+            
         losers = pd.DataFrame(data.get('top_losers', []))
+        if losers.empty: return pd.DataFrame()
+        
         losers['volume'] = pd.to_numeric(losers['volume'])
         df_filtered = losers[losers['volume'] > 50000].head(10).copy()
         
@@ -131,7 +137,7 @@ def run_pigeon_bite_logic():
             df = t.history(period="5d", interval="15m")
             if df.empty: continue
             
-            # 2. Tech Indicators (Manual calculation to avoid errors)
+            # Tech Indicators Calculation
             df['Mid'] = df['Close'].rolling(window=20).mean()
             df['STD'] = df['Close'].rolling(window=20).std()
             df['Lower'] = df['Mid'] - (df['STD'] * 2)
@@ -141,26 +147,26 @@ def run_pigeon_bite_logic():
             loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
             df['RSI'] = 100 - (100 / (1 + (gain / loss)))
             
-            # 3. Fundamentals
+							 
             info = t.info
             mkt_cap = info.get('marketCap', 0)
             float_shares = info.get('floatShares', 0)
             inst_own_raw = info.get('heldPercentInstitutions', 0)
             inst_own_pct = round(inst_own_raw * 100, 2) if inst_own_raw else 0
             
-            # 4. Latest values
+							  
             last_row = df.iloc[-1]
             price = last_row['Close']
             lower = last_row['Lower']
             mid = last_row['Mid']
             rsi = last_row['RSI']
-            volume = last_row['Volume'] # 15m volume (can also use info.get('volume'))
+																					  
             
-            # Calculate Turnover (Daily Volume vs Float)
+														
             daily_vol = info.get('volume', 0)
             turnover = (daily_vol / float_shares * 100) if float_shares else 0
             
-            # 5. Recommendation Logic
+									 
             rec = "HOLD/WAIT"
             if price <= lower and rsi < 30:
                 rec = "🔥 STRONG BUY (Capitulation)"
@@ -192,9 +198,15 @@ def run_pigeon_bite_logic():
 st.set_page_config(layout="wide", page_title="Pigeon Bite AI Dashboard")
 st.title("🐦 Pigeon Bite Watchdog v2.0")
 
-@st.fragment(run_every="15m")
+# Fragments allow parts of the UI to update without refreshing the whole app
+@st.fragment(run_every="90m") # UPDATED: Changed from 15m to 90m
 def main_dashboard():
-    st.subheader(f"Last Refresh: {datetime.now().strftime('%H:%M:%S')}")
+    st.subheader(f"Next Auto-Refresh in 90 mins. Last: {datetime.now().strftime('%H:%M:%S')}")
+    
+    if st.button("🔄 Force Manual Refresh"):
+        st.cache_data.clear()
+        st.rerun()
+
     master_df = run_pigeon_bite_logic()
     
     if not master_df.empty:
@@ -203,7 +215,8 @@ def main_dashboard():
             if "DILUTION" in str(val): return 'background-color: #f8d7da; color: #721c24'
             return ''
 
-        st.dataframe(master_df.style.applymap(highlight_rec), use_container_width=True, hide_index=True)
+        # FIXED Syntax: Changed applymap to map, and use_container_width to width="stretch"
+        st.dataframe(master_df.style.map(highlight_rec), width="stretch", hide_index=True)
         
         st.divider()
         st.header("🧠 AI Deep Dive (Agent Analysis)")
@@ -211,12 +224,11 @@ def main_dashboard():
         
         if st.button("Run AI Agent"):
             with st.spinner(f"Agent is searching news for {selected_ticker}..."):
-                # CALLS THE NEW AGENT LOGIC
+										   
                 analysis = get_ai_recovery_score(selected_ticker)
                 st.markdown(f"### Analysis for {selected_ticker}")
                 st.write(analysis)
     else:
-        st.warning("No losers found or API limit reached.")
+        st.warning("No losers found or API limit reached. App will retry in 90 minutes.")
 
 main_dashboard()
-
