@@ -34,7 +34,7 @@ SEC_ITEM_MAP = {
 google_search_tool = {"google_search": {}}
 
 class Agent:
-    def __init__(self, model_name="gemini-2.5-flash-lite", system=""):
+    def __init__(self, model_name="gemini-1.5-flash", system=""):
         self.system = system
         # Initialize LLM with the secret key
         self.llm = ChatGoogleGenerativeAI(
@@ -78,7 +78,7 @@ class Agent:
 @st.cache_resource
 def get_pigeon_bot(system_prompt):
     """Creates the Agent once and stores it in memory to avoid 429 errors"""
-    return Agent(model_name="gemini-2.5-flash-lite", system=system_prompt)
+    return Agent(model_name="gemini-1.5-flash", system=system_prompt)
 
 # --- CORE FUNCTIONS ---
 
