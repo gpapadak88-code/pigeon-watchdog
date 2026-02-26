@@ -11,6 +11,7 @@ import yfinance as yf
 from datetime import datetime
 from edgar import Company, set_identity
 import os
+import time
 
 # --- NEW IMPORTS FOR THE FULL AGENT ---
 from langgraph.graph import StateGraph, END
@@ -34,9 +35,8 @@ SEC_ITEM_MAP = {
 google_search_tool = {"google_search": {}}
 
 class Agent:
-    def __init__(self, model_name="gemini-2.5-flash-lite", system=""):
+    def __init__(self, model_name="gemini-1.5-flash", system=""):
         self.system = system
-        # Initialize LLM with the secret key
         self.llm = ChatGoogleGenerativeAI(
             model=model_name,
             api_key=st.secrets["GOOGLE_API_KEY"]
@@ -77,8 +77,7 @@ class Agent:
 # --- CACHED INITIALIZATION ---
 @st.cache_resource
 def get_pigeon_bot(system_prompt):
-    """Creates the Agent once and stores it in memory to avoid 429 errors"""
-    return Agent(model_name="gemini-2.5-flash-lite", system=system_prompt)
+    return Agent(model_name="gemini-1.5-flash", system=system_prompt)
 
 # --- CORE FUNCTIONS ---
 
@@ -107,20 +106,22 @@ def get_ai_recovery_score(ticker):
     except Exception as e:
         return f"Agent Error: {str(e)}"
 
-@st.cache_data(ttl=5400) # 90 minutes cache
+@st.cache_data(ttl=5400)
 def run_pigeon_bite_logic():
+    # Use standard headers to avoid Cloud IP blocks
+    headers = {'User-Agent': 'Mozilla/5.0'}
     api_key = st.secrets["ALPHA_VANTAGE_KEY"]
     url = f'https://www.alphavantage.co/query?function=TOP_GAINERS_LOSERS&apikey={api_key}'
     
     try:
-        response = requests.get(url)
-        if response.status_code == 429:
-            st.error("Server Rate Limit (429). Waiting for cooldown...")
-            return pd.DataFrame()
-
+        response = requests.get(url, headers=headers, timeout=15)
+        
+        # Save raw data to session state for the Debugger to read
+        st.session_state['raw_debug'] = response.json()
+        st.session_state['last_status'] = response.status_code
+        
         data = response.json()
-        if "Note" in data:
-            st.warning("Alpha Vantage API Limit reached.")
+        if "top_losers" not in data:
             return pd.DataFrame()
             
         losers = pd.DataFrame(data.get('top_losers', []))
@@ -170,20 +171,14 @@ def run_pigeon_bite_logic():
             sec_data = get_sec_insight(symbol)
 
             final_results.append({
-                'Ticker': symbol,
-                'Price': round(price, 4),
-                'Inst. Own %': f"{inst_own_pct}%",
-                "SEC Reason": sec_data,
-                'RSI': round(rsi, 2),
-                'Turnover %': round(turnover, 2),
-                'Market Cap ($M)': round(mkt_cap / 1_000_000, 2),
-                'Rec': rec,
-                'ENTRY (Limit)': round(lower, 4),
-                'EXIT (Target)': round(mid, 4)
+                'Ticker': symbol, 'Price': round(price, 4), 'Inst. Own %': f"{inst_own_pct}%",
+                "SEC Reason": sec_data, 'RSI': round(rsi, 2), 'Turnover %': round(turnover, 2),
+                'Market Cap ($M)': round(mkt_cap / 1_000_000, 2), 'Rec': rec,
+                'ENTRY (Limit)': round(lower, 4), 'EXIT (Target)': round(mid, 4)
             })
         return pd.DataFrame(final_results)
     except Exception as e:
-        st.error(f"Engine Error: {e}")
+        st.session_state['last_error'] = str(e)
         return pd.DataFrame()
 
 # --- STREAMLIT UI ---
@@ -192,7 +187,7 @@ st.title("🐦 Pigeon Bite Watchdog v2.0")
 
 @st.fragment(run_every="90m")
 def main_dashboard():
-    st.subheader(f"Next Auto-Refresh in 90 mins. Last: {datetime.now().strftime('%H:%M:%S')}")
+    st.subheader(f"Next Auto-Refresh: 90m. Last: {datetime.now().strftime('%H:%M:%S')}")
     
     if st.button("🔄 Force Manual Refresh"):
         st.cache_data.clear()
@@ -207,28 +202,32 @@ def main_dashboard():
             return ''
 
         st.dataframe(master_df.style.map(highlight_rec), width="stretch", hide_index=True)
-        
         st.divider()
-        st.header("🧠 AI Deep Dive (Agent Analysis)")
-        selected_ticker = st.selectbox("Select a ticker for AI News:", master_df['Ticker'])
+        st.header("🧠 AI Deep Dive")
+        selected_ticker = st.selectbox("Select ticker:", master_df['Ticker'])
         
         if st.button("Run AI Agent"):
-            # Use cached resource to avoid 429 Resource Exhausted on cloud
             try:
-                prompt = """You are an expert Equity Research Assistant. Investigate price drops.
-                         1. Primary Cause. 2. Structural vs Transitory. 3. Recovery Catalysts. 4. Sentiment.
-                         Provide 'Recovery Score' 1-10."""
-                
-                # Initialize/Retrieve the cached agent
+                prompt = "Expert Equity Research Assistant. Recovery Score 1-10."
                 st.session_state.pigeon_bot = get_pigeon_bot(prompt)
-                
-                with st.spinner(f"Agent is searching fresh news for {selected_ticker}..."):
+                with st.spinner(f"Analyzing {selected_ticker}..."):
                     analysis = get_ai_recovery_score(selected_ticker)
-                    st.markdown(f"### Analysis for {selected_ticker}")
                     st.write(analysis)
             except Exception as e:
-                st.error(f"Google Rate Limit or Cloud Block: {e}. Try again in 1 minute.")
+                st.error(f"Agent Error: {e}")
     else:
-        st.warning("Waiting for data... If markets are closed or limit is reached, check back later.")
+        # --- ENHANCED DEBUG SECTION ---
+        st.warning("Waiting for data... API or Markets might be offline.")
+        with st.expander("🛠️ Cloud Debug Console (Open this to see why it fails)"):
+            st.write(f"**Current Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            if 'last_status' in st.session_state:
+                st.write(f"**API Status Code:** {st.session_state['last_status']}")
+            if 'raw_debug' in st.session_state:
+                st.write("**Raw API Response:**")
+                st.json(st.session_state['raw_debug'])
+            if 'last_error' in st.session_state:
+                st.error(f"**Python Error:** {st.session_state['last_error']}")
+            
+            st.info("💡 Tip: If 'Note' appears in the JSON above, you've hit the Alpha Vantage 429 limit.")
 
 main_dashboard()
