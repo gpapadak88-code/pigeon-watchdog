@@ -35,7 +35,7 @@ SEC_ITEM_MAP = {
 google_search_tool = {"google_search": {}}
 
 class Agent:
-    def __init__(self, model_name="gemini-1.5-flash", system=""):
+    def __init__(self, model_name="gemini-2.5-flash-lite", system=""):
         self.system = system
         self.llm = ChatGoogleGenerativeAI(
             model=model_name,
@@ -77,7 +77,8 @@ class Agent:
 # --- CACHED INITIALIZATION ---
 @st.cache_resource
 def get_pigeon_bot(system_prompt):
-    return Agent(model_name="gemini-1.5-flash", system=system_prompt)
+    """Creates the Agent once and stores it in memory"""
+    return Agent(model_name="gemini-2.5-flash-lite", system=system_prompt)
 
 # --- CORE FUNCTIONS ---
 
@@ -106,21 +107,21 @@ def get_ai_recovery_score(ticker):
     except Exception as e:
         return f"Agent Error: {str(e)}"
 
-@st.cache_data(ttl=5400)
+@st.cache_data(ttl=5400) # 90 minutes cache
 def run_pigeon_bite_logic():
-    # Use standard headers to avoid Cloud IP blocks
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    # Use headers to make the Cloud request look like a browser
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     api_key = st.secrets["ALPHA_VANTAGE_KEY"]
     url = f'https://www.alphavantage.co/query?function=TOP_GAINERS_LOSERS&apikey={api_key}'
     
     try:
         response = requests.get(url, headers=headers, timeout=15)
-        
-        # Save raw data to session state for the Debugger to read
-        st.session_state['raw_debug'] = response.json()
-        st.session_state['last_status'] = response.status_code
-        
         data = response.json()
+        
+        # Store for debug expander
+        st.session_state['raw_debug'] = data
+        st.session_state['last_status'] = response.status_code
+
         if "top_losers" not in data:
             return pd.DataFrame()
             
@@ -132,10 +133,16 @@ def run_pigeon_bite_logic():
         
         final_results = []
         for symbol in df_filtered['ticker']:
-            t = yf.Ticker(symbol)
-            df = t.history(period="5d", interval="15m")
-            if df.empty: continue
+            # CLEAN SYMBOL: Remove '+', '-', or '.' for Yahoo compatibility
+            clean_symbol = symbol.replace('+', '').replace('-', '').split('.')[0]
             
+            t = yf.Ticker(clean_symbol)
+            df = t.history(period="5d", interval="15m")
+            
+            if df.empty:
+                continue # Skips if Yahoo can't find data
+            
+            # Technical Indicators
             df['Mid'] = df['Close'].rolling(window=20).mean()
             df['STD'] = df['Close'].rolling(window=20).std()
             df['Lower'] = df['Mid'] - (df['STD'] * 2)
@@ -143,11 +150,12 @@ def run_pigeon_bite_logic():
             delta = df['Close'].diff()
             gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-            df['RSI'] = 100 - (100 / (1 + (gain / loss)))
+            # Added 1e-9 to prevent division by zero
+            df['RSI'] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
             
             info = t.info
             mkt_cap = info.get('marketCap', 0)
-            float_shares = info.get('floatShares', 0)
+            float_shares = info.get('floatShares', 1) # Prevent div by zero
             inst_own_raw = info.get('heldPercentInstitutions', 0)
             inst_own_pct = round(inst_own_raw * 100, 2) if inst_own_raw else 0
             
@@ -171,10 +179,16 @@ def run_pigeon_bite_logic():
             sec_data = get_sec_insight(symbol)
 
             final_results.append({
-                'Ticker': symbol, 'Price': round(price, 4), 'Inst. Own %': f"{inst_own_pct}%",
-                "SEC Reason": sec_data, 'RSI': round(rsi, 2), 'Turnover %': round(turnover, 2),
-                'Market Cap ($M)': round(mkt_cap / 1_000_000, 2), 'Rec': rec,
-                'ENTRY (Limit)': round(lower, 4), 'EXIT (Target)': round(mid, 4)
+                'Ticker': symbol,
+                'Price': round(price, 4),
+                'Inst. Own %': f"{inst_own_pct}%",
+                "SEC Reason": sec_data,
+                'RSI': round(rsi, 2),
+                'Turnover %': round(turnover, 2),
+                'Market Cap ($M)': round(mkt_cap / 1_000_000, 2),
+                'Rec': rec,
+                'ENTRY (Limit)': round(lower, 4),
+                'EXIT (Target)': round(mid, 4)
             })
         return pd.DataFrame(final_results)
     except Exception as e:
@@ -201,25 +215,32 @@ def main_dashboard():
             if "DILUTION" in str(val): return 'background-color: #f8d7da; color: #721c24'
             return ''
 
+        # Updated to width="stretch" and .map for 2026 standards
         st.dataframe(master_df.style.map(highlight_rec), width="stretch", hide_index=True)
+        
         st.divider()
-        st.header("🧠 AI Deep Dive")
-        selected_ticker = st.selectbox("Select ticker:", master_df['Ticker'])
+        st.header("🧠 AI Deep Dive (Agent Analysis)")
+        selected_ticker = st.selectbox("Select a ticker for AI News:", master_df['Ticker'])
         
         if st.button("Run AI Agent"):
             try:
-                prompt = "Expert Equity Research Assistant. Recovery Score 1-10."
+                prompt = """You are an expert Equity Research Assistant. Investigate price drops.
+                         1. Cause. 2. Structural/Transitory. 3. Catalysts. 4. Sentiment.
+                         Provide 'Recovery Score' 1-10."""
+                
                 st.session_state.pigeon_bot = get_pigeon_bot(prompt)
-                with st.spinner(f"Analyzing {selected_ticker}..."):
+                
+                with st.spinner(f"Agent is searching fresh news for {selected_ticker}..."):
                     analysis = get_ai_recovery_score(selected_ticker)
+                    st.markdown(f"### Analysis for {selected_ticker}")
                     st.write(analysis)
             except Exception as e:
-                st.error(f"Agent Error: {e}")
+                st.error(f"AI Error: {e}")
     else:
-        # --- ENHANCED DEBUG SECTION ---
-        st.warning("Waiting for data... API or Markets might be offline.")
-        with st.expander("🛠️ Cloud Debug Console (Open this to see why it fails)"):
-            st.write(f"**Current Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        st.warning("Waiting for data... Check the console below for details.")
+        
+        # --- NEW DEBUG SECTION ---
+        with st.expander("🛠️ Cloud Debug Console"):
             if 'last_status' in st.session_state:
                 st.write(f"**API Status Code:** {st.session_state['last_status']}")
             if 'raw_debug' in st.session_state:
@@ -227,7 +248,5 @@ def main_dashboard():
                 st.json(st.session_state['raw_debug'])
             if 'last_error' in st.session_state:
                 st.error(f"**Python Error:** {st.session_state['last_error']}")
-            
-            st.info("💡 Tip: If 'Note' appears in the JSON above, you've hit the Alpha Vantage 429 limit.")
 
 main_dashboard()
